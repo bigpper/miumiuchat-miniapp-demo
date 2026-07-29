@@ -232,7 +232,7 @@
             pageNonce: pageNonce,
             pkceChallenge: randomBase64url(32),
             pkceMethod: "S256",
-            requestedCapabilities: ["host.context"]
+            requestedCapabilities: ["auth.launch", "host.context", "host.close"]
           },
           error: null
         }, brokerOrigin);
