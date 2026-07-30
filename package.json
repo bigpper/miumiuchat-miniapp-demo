@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test miniapp-sdk.test.mjs"
+    "test": "node --experimental-vm-modules --test miniapp-sdk.test.mjs"
   }
 }

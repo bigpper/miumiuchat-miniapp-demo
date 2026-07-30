@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import {readFile} from 'node:fs/promises'
 import test from 'node:test'
+import vm from 'node:vm'
 
 import {createMiniAppSdk} from './miniapp-sdk.js'
 
@@ -8,6 +10,7 @@ const HOST_ORIGIN = 'https://im.example.com'
 const BROKER_URL = `${HOST_ORIGIN}/miniapp-host-broker.html`
 const LOCAL_BROKER_URL = 'http://localhost:8080/miniapp-host-broker.html'
 const NOW_MS = Date.parse('2026-07-30T00:00:00.000Z')
+const MAX_ENVELOPE_BYTES = 16 * 1024
 const NONCE = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 const VERIFIER = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~'
 const ID = '01KYN5H8CWSR2PJ6Q8WE46P12W'
@@ -45,6 +48,13 @@ function envelope(overrides = {}) {
   }
 }
 
+function envelopeAtByteLength(length) {
+  const payload = {...envelope().payload, locale: ''}
+  const overhead = new TextEncoder().encode(JSON.stringify(envelope({payload}))).byteLength
+  assert.ok(overhead < length)
+  return envelope({payload: {...payload, locale: 'x'.repeat(length - overhead)}})
+}
+
 function createHarness({
   name = preload(),
   preloadedName,
@@ -55,17 +65,32 @@ function createHarness({
 } = {}) {
   const listeners = new Map()
   const iframeListeners = new Map()
+  const domWrites = []
   const iframe = {
     contentWindow: {
       sent: [],
       postMessage(message, targetOrigin) { this.sent.push({message, targetOrigin}) }
     },
     removeCalled: false,
-    setAttribute() {},
+    setAttribute(name, value) { domWrites.push(String(value)) },
     addEventListener(type, listener) { iframeListeners.set(type, listener) },
     removeEventListener(type, listener) { if (iframeListeners.get(type) === listener) iframeListeners.delete(type) },
     remove() { this.removeCalled = true }
   }
+  Object.defineProperties(iframe, {
+    src: {
+      get() { return this._src },
+      set(value) { this._src = value; domWrites.push(String(value)) }
+    },
+    title: {
+      get() { return this._title },
+      set(value) { this._title = value; domWrites.push(String(value)) }
+    },
+    hidden: {
+      get() { return this._hidden },
+      set(value) { this._hidden = value; domWrites.push(String(value)) }
+    }
+  })
   const document = {
     documentElement: {dataset: {}},
     body: {appendChild(value) { assert.equal(value, iframe) }},
@@ -87,6 +112,14 @@ function createHarness({
       console: forbidden('console')
     })
     Object.defineProperty(document, 'cookie', forbidden('cookie'))
+    Object.defineProperties(document.body, {
+      innerHTML: forbidden('body.innerHTML'),
+      textContent: forbidden('body.textContent')
+    })
+    Object.defineProperties(iframe, {
+      innerHTML: forbidden('iframe.innerHTML'),
+      textContent: forbidden('iframe.textContent')
+    })
   }
   const crypto = {
     getRandomValues(bytes) { bytes.fill(1); return bytes },
@@ -111,7 +144,7 @@ function createHarness({
     onLaunchCode: launchCodeHandler,
     now: () => NOW_MS
   })
-  return {sdk, window, document, iframe, listeners, iframeListeners, statuses}
+  return {sdk, window, document, iframe, listeners, iframeListeners, statuses, domWrites}
 }
 
 function bound(harness) {
@@ -126,6 +159,40 @@ function bound(harness) {
 async function settle() {
   await Promise.resolve()
   await Promise.resolve()
+}
+
+async function runInlineBootstrap({rejectImport = false} = {}) {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8')
+  const inlineScript = html.match(/<script>\s*([\s\S]*?)<\/script>\s*<\/body>/)?.[1]
+  assert.ok(inlineScript)
+  const preloadValue = preload({brokerUrl: LOCAL_BROKER_URL})
+  const status = {textContent: ''}
+  const detail = {textContent: ''}
+  const document = {
+    documentElement: {dataset: {}},
+    getElementById(id) { return id === 'bridge-status' ? status : detail }
+  }
+  const window = {name: preloadValue}
+  const options = []
+  let importCalls = 0
+  const context = vm.createContext({window, document})
+  const importedModule = new vm.SyntheticModule(['createMiniAppSdk'], function () {
+    this.setExport('createMiniAppSdk', value => options.push(value))
+  }, {context})
+  await importedModule.link(() => {})
+  await importedModule.evaluate()
+  const script = new vm.Script(inlineScript, {
+    importModuleDynamically: async specifier => {
+      importCalls += 1
+      assert.equal(window.name, '')
+      assert.equal(specifier, './miniapp-sdk.js')
+      if (rejectImport) throw new Error('module load failed')
+      return importedModule
+    }
+  })
+  script.runInContext(context)
+  await settle()
+  return {window, document, status, detail, options, importCalls, preloadValue}
 }
 
 test('clears window.name synchronously before any asynchronous PKCE work', () => {
@@ -214,6 +281,7 @@ test('accepts only a contract-exact host.init for the correlated READY request i
     {...envelope().payload, locale: ''},
     {...envelope().payload, theme: {...envelope().payload.theme, extra: true}},
     {...envelope().payload, safeArea: {...envelope().payload.safeArea, top: -1}},
+    {...envelope().payload, grantedCapabilities: new Array(1)},
     {...envelope().payload, locale: 'x'.repeat(17_000)}
   ]) {
     listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({payload})})
@@ -222,6 +290,30 @@ test('accepts only a contract-exact host.init for the correlated READY request i
   listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope()})
   assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
   assert.equal(JSON.stringify(harness.sdk.status()).includes(NONCE), false)
+})
+
+test('accepts a 16,384-byte envelope and rejects a 16,385-byte envelope', async () => {
+  const accepted = createHarness()
+  bound(accepted)
+  await settle()
+  accepted.listeners.get('message')({
+    source: accepted.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: envelopeAtByteLength(MAX_ENVELOPE_BYTES)
+  })
+  assert.deepEqual(accepted.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
+
+  const rejected = createHarness()
+  bound(rejected)
+  await settle()
+  rejected.listeners.get('message')({
+    source: rejected.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: envelopeAtByteLength(MAX_ENVELOPE_BYTES + 1)
+  })
+  assert.deepEqual(rejected.sdk.status(), {phase: 'READY_SENT', terminal: null})
 })
 
 test('invokes the launch callback exactly once with a transport-local code after auth.launch is granted', async () => {
@@ -309,4 +401,72 @@ test('does not touch browser persistence, navigation, console, cookie, or DOM si
   assert.equal(harness.statuses.every(status =>
     Object.keys(status).every(key => ['phase', 'terminal'].includes(key))
   ), true)
+})
+
+test('keeps every browser sink clean through the full trusted lifecycle', async () => {
+  let launchCalls = 0
+  const harness = createHarness({
+    runtimeTraps: true,
+    launchCodeHandler() { launchCalls += 1 }
+  })
+  bound(harness)
+  await settle()
+  harness.listeners.get('message')({
+    source: harness.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: envelope()
+  })
+  const launch = envelope({
+    kind: 'event',
+    method: 'auth.launchCode',
+    payload: {
+      appId: APP_ID,
+      versionId: '01KYN5H8CWSR2PJ6Q8WE46P12X',
+      launchCode: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      expiresAt: new Date(NOW_MS + 60_000).toISOString()
+    }
+  })
+  harness.listeners.get('message')({
+    source: harness.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: launch
+  })
+  assert.equal(launchCalls, 1)
+  assert.deepEqual(harness.sdk.status(), {phase: 'RUNNING', terminal: 'WEB'})
+  assert.equal(harness.statuses.every(status =>
+    Object.keys(status).every(key => ['phase', 'terminal'].includes(key))
+  ), true)
+  assert.equal(JSON.stringify([harness.sdk.status(), harness.sdk.diagnostics()]).includes(NONCE), false)
+  assert.equal(JSON.stringify([harness.sdk.status(), harness.sdk.diagnostics()]).includes(VERIFIER), false)
+  assert.equal(JSON.stringify([harness.sdk.status(), harness.sdk.diagnostics()]).includes(launch.payload.launchCode), false)
+  assert.equal(JSON.stringify(harness.domWrites).includes(NONCE), false)
+  assert.equal(JSON.stringify(harness.domWrites).includes(VERIFIER), false)
+  assert.equal(JSON.stringify(harness.domWrites).includes(launch.payload.launchCode), false)
+  harness.sdk.destroy()
+  assert.deepEqual(harness.sdk.diagnostics(), {destroyed: true, privateStateCleared: true})
+})
+
+test('executes the real inline bootstrap with a synchronously cleared captured preload', async () => {
+  const result = await runInlineBootstrap()
+  assert.equal(result.window.name, '')
+  assert.equal(result.importCalls, 1)
+  assert.equal(result.options.length, 1)
+  assert.equal(result.options[0].preloadedName, result.preloadValue)
+  assert.deepEqual(Array.from(result.options[0].trustedBrokerUrls), [LOCAL_BROKER_URL])
+  assert.equal(result.status.textContent.includes(result.preloadValue), false)
+  assert.equal(result.detail.textContent.includes(result.preloadValue), false)
+  assert.equal(JSON.stringify(result.document.documentElement.dataset).includes(result.preloadValue), false)
+})
+
+test('renders only BLOCKED copy when the real inline bootstrap import fails', async () => {
+  const result = await runInlineBootstrap({rejectImport: true})
+  assert.equal(result.window.name, '')
+  assert.equal(result.importCalls, 1)
+  assert.equal(result.options.length, 0)
+  assert.equal(result.status.textContent, '请从聊天系统打开')
+  assert.equal(result.detail.textContent, '此演示页只能作为 MiniApp 在聊天系统中运行。')
+  assert.equal(result.status.textContent.includes(result.preloadValue), false)
+  assert.equal(result.detail.textContent.includes(result.preloadValue), false)
 })

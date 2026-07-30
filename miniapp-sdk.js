@@ -138,6 +138,16 @@ function validSafeArea(value) {
     && SAFE_AREA_FIELDS.every(key => Number.isFinite(value[key]) && value[key] >= 0)
 }
 
+function isDenseCapabilityArray(value) {
+  return Array.isArray(value)
+    && Object.keys(value).length === value.length
+    && value.every((capability, index) =>
+      Object.prototype.hasOwnProperty.call(value, index)
+        && typeof capability === 'string'
+        && REQUESTED_CAPABILITIES.includes(capability)
+    )
+}
+
 function validHostInit(value, appId, nonce, readyRequestId) {
   const payload = value.payload
   return value.kind === 'response'
@@ -149,9 +159,8 @@ function validHostInit(value, appId, nonce, readyRequestId) {
     && payload.appId === appId
     && payload.sdkVersion === '1.0.0'
     && payload.protocolVersion === VERSION
-    && Array.isArray(payload.grantedCapabilities)
+    && isDenseCapabilityArray(payload.grantedCapabilities)
     && new Set(payload.grantedCapabilities).size === payload.grantedCapabilities.length
-    && payload.grantedCapabilities.every(capability => REQUESTED_CAPABILITIES.includes(capability))
     && payload.terminal === 'WEB'
     && typeof payload.locale === 'string' && payload.locale.length > 0
     && validTheme(payload.theme)
