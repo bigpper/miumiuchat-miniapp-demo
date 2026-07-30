@@ -6,6 +6,9 @@ const ENVELOPE_FIELDS = Object.freeze([
 ])
 const PRELOAD_FIELDS = Object.freeze(['protocol', 'version', 'kind', 'brokerUrl'])
 const BROKER_BOUND_FIELDS = Object.freeze(['protocol', 'version', 'kind'])
+const DIRECT_BOUND_FIELDS = Object.freeze([
+  'protocol', 'version', 'kind', 'bindingId'
+])
 const HOST_INIT_FIELDS = Object.freeze([
   'appId', 'sdkVersion', 'protocolVersion', 'grantedCapabilities', 'terminal',
   'locale', 'theme', 'safeArea'
@@ -109,6 +112,14 @@ function validBound(value) {
     && value.kind === 'bound'
 }
 
+function validDirectBound(value, bindingId) {
+  return hasExactKeys(value, DIRECT_BOUND_FIELDS)
+    && value.protocol === BROKER_PROTOCOL
+    && value.version === VERSION
+    && value.kind === 'direct-bound'
+    && value.bindingId === bindingId
+}
+
 function validEnvelope(value) {
   let serialized
   try { serialized = JSON.stringify(value) } catch { return false }
@@ -208,6 +219,9 @@ export function createMiniAppSdk({
 
   let brokerFrame = null
   let brokerOrigin = null
+  let transportWindow = null
+  let directBindingId = null
+  let directBridge = false
   let pageNonce = null
   let pkceVerifier = null
   let readyRequestId = null
@@ -240,6 +254,9 @@ export function createMiniAppSdk({
     }
     brokerFrame = null
     brokerOrigin = null
+    transportWindow = null
+    directBindingId = null
+    directBridge = false
     pageNonce = null
     pkceVerifier = null
     readyRequestId = null
@@ -263,6 +280,8 @@ export function createMiniAppSdk({
       destroyed,
       privateStateCleared: brokerFrame === null
         && brokerOrigin === null
+        && transportWindow === null
+        && directBindingId === null
         && pageNonce === null
         && pkceVerifier === null
         && readyRequestId === null
@@ -270,7 +289,7 @@ export function createMiniAppSdk({
   }
 
   async function sendReady() {
-    if (destroyed || readyStarted || !brokerFrame || !brokerOrigin) return
+    if (destroyed || readyStarted || !transportWindow || !brokerOrigin) return
     readyStarted = true
     try {
       pageNonce = createNonce()
@@ -279,12 +298,12 @@ export function createMiniAppSdk({
         || typeof pkceVerifier !== 'string'
         || !/^[A-Za-z0-9\-._~]{43,128}$/.test(pkceVerifier)) throw new TypeError('invalid local key material')
       const digest = await cryptoObject.subtle.digest('SHA-256', new TextEncoder().encode(pkceVerifier))
-      if (destroyed || !brokerFrame || !brokerFrame.contentWindow) return
+      if (destroyed || !transportWindow) return
       const challenge = base64url(new Uint8Array(digest))
       if (decodedBase64urlBytes(challenge) !== 32) throw new TypeError('invalid challenge')
       readyRequestId = createId()
       if (!isCanonicalUlid(readyRequestId)) throw new TypeError('invalid request id')
-      brokerFrame.contentWindow.postMessage({
+      transportWindow.postMessage({
         protocol: PROTOCOL,
         version: VERSION,
         id: readyRequestId,
@@ -309,10 +328,11 @@ export function createMiniAppSdk({
   }
 
   function onMessage(event) {
-    if (destroyed || !brokerFrame || event.source !== brokerFrame.contentWindow
+    if (destroyed || !transportWindow || event.source !== transportWindow
       || event.origin !== brokerOrigin || (event.ports && event.ports.length > 0)) return
     const data = event.data
-    if (validBound(data)) {
+    if ((!directBridge && validBound(data))
+      || (directBridge && validDirectBound(data, directBindingId))) {
       sendReady()
       return
     }
@@ -341,6 +361,38 @@ export function createMiniAppSdk({
 
   const brokerUrl = canonicalBrokerUrl(parsed.brokerUrl)
   brokerOrigin = brokerUrl.origin
+  directBridge = brokerUrl.protocol === 'http:'
+    && brokerUrl.hostname === 'localhost'
+    && brokerUrl.pathname === '/miniapp-host-broker.html'
+    && windowObject.location?.protocol === 'https:'
+    && windowObject.parent
+    && windowObject.parent !== windowObject
+  if (directBridge) {
+    try {
+      directBindingId = secureUlid(cryptoObject)
+    } catch {
+      brokerOrigin = null
+      directBridge = false
+      destroyed = true
+      publish('BLOCKED', null)
+      return Object.freeze({status, destroy: cleanup, diagnostics})
+    }
+    transportWindow = windowObject.parent
+    windowObject.addEventListener('message', onMessage)
+    windowObject.addEventListener('pagehide', cleanup, {once: true})
+    publish('CONNECTING', null)
+    try {
+      transportWindow.postMessage({
+        protocol: BROKER_PROTOCOL,
+        version: VERSION,
+        kind: 'direct-hello',
+        bindingId: directBindingId
+      }, brokerOrigin)
+    } catch {
+      failClosed()
+    }
+    return Object.freeze({status, destroy: cleanup, diagnostics})
+  }
   brokerFrame = documentObject.createElement('iframe')
   brokerFrame.src = brokerUrl.href
   brokerFrame.title = 'MiniApp secure bridge'
@@ -349,6 +401,7 @@ export function createMiniAppSdk({
   windowObject.addEventListener('message', onMessage)
   windowObject.addEventListener('pagehide', cleanup, {once: true})
   documentObject.body.appendChild(brokerFrame)
+  transportWindow = brokerFrame.contentWindow
   publish('CONNECTING', null)
   return Object.freeze({status, destroy: cleanup, diagnostics})
 }

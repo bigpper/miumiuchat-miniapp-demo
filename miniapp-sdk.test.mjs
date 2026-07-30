@@ -61,11 +61,13 @@ function createHarness({
   trustedBrokerUrls = [BROKER_URL],
   launchCodeHandler = () => {},
   digestResult = async () => Uint8Array.from({length: 32}, (_, index) => index).buffer,
+  randomFailure = false,
   runtimeTraps = false
 } = {}) {
   const listeners = new Map()
   const iframeListeners = new Map()
   const domWrites = []
+  const appended = []
   const iframe = {
     contentWindow: {
       sent: [],
@@ -93,14 +95,23 @@ function createHarness({
   })
   const document = {
     documentElement: {dataset: {}},
-    body: {appendChild(value) { assert.equal(value, iframe) }},
+    body: {appendChild(value) { assert.equal(value, iframe); appended.push(value) }},
     createElement(type) { assert.equal(type, 'iframe'); return iframe }
+  }
+  const parentWindow = {
+    sent: [],
+    postMessage(message, targetOrigin) {
+      this.sent.push({message, targetOrigin})
+    }
   }
   const window = {
     name,
+    location: {protocol: 'https:'},
+    parent: parentWindow,
     addEventListener(type, listener) { listeners.set(type, listener) },
     removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type) }
   }
+  window.self = window
   if (runtimeTraps) {
     const forbidden = name => ({get() { throw new Error(`${name} touched`) }})
     Object.defineProperties(window, {
@@ -122,7 +133,11 @@ function createHarness({
     })
   }
   const crypto = {
-    getRandomValues(bytes) { bytes.fill(1); return bytes },
+    getRandomValues(bytes) {
+      if (randomFailure) throw new Error('random source failed')
+      bytes.fill(1)
+      return bytes
+    },
     subtle: {async digest(name, bytes) {
       assert.equal(name, 'SHA-256')
       assert.equal(new TextDecoder().decode(bytes), VERIFIER)
@@ -144,7 +159,18 @@ function createHarness({
     onLaunchCode: launchCodeHandler,
     now: () => NOW_MS
   })
-  return {sdk, window, document, iframe, listeners, iframeListeners, statuses, domWrites}
+  return {
+    sdk,
+    window,
+    parentWindow,
+    document,
+    iframe,
+    appended,
+    listeners,
+    iframeListeners,
+    statuses,
+    domWrites
+  }
 }
 
 function bound(harness) {
@@ -153,6 +179,21 @@ function bound(harness) {
     origin: HOST_ORIGIN,
     ports: [],
     data: {protocol: 'boxim-miniapp-broker', version: '1.0', kind: 'bound'}
+  })
+}
+
+function directBound(harness) {
+  const hello = harness.parentWindow.sent[0]?.message
+  harness.listeners.get('message')({
+    source: harness.parentWindow,
+    origin: 'http://localhost:8080',
+    ports: [],
+    data: {
+      protocol: 'boxim-miniapp-broker',
+      version: '1.0',
+      kind: 'direct-bound',
+      bindingId: hello?.bindingId || ID
+    }
   })
 }
 
@@ -231,6 +272,110 @@ test('accepts only an exactly allowlisted localhost broker and rejects all other
     assert.equal(harness.sdk.status().phase, 'BLOCKED')
     assert.equal(harness.listeners.size, 0)
   }
+})
+
+test('uses a parent-bound bridge for the exact HTTPS-to-localhost mixed-content case', async () => {
+  const harness = createHarness({
+    name: preload({brokerUrl: LOCAL_BROKER_URL}),
+    trustedBrokerUrls: [LOCAL_BROKER_URL]
+  })
+  assert.equal(harness.appended.length, 0)
+  const directHello = harness.parentWindow.sent[0]
+  assert.equal(directHello.targetOrigin, 'http://localhost:8080')
+  assert.equal(directHello.message.protocol, 'boxim-miniapp-broker')
+  assert.equal(directHello.message.version, '1.0')
+  assert.equal(directHello.message.kind, 'direct-hello')
+  assert.match(directHello.message.bindingId, /^[0-9A-HJKMNP-TV-Z]{26}$/)
+
+  const listener = harness.listeners.get('message')
+  for (const event of [
+    {
+      source: {},
+      origin: 'http://localhost:8080',
+      ports: [],
+      data: {
+        protocol: 'boxim-miniapp-broker',
+        version: '1.0',
+        kind: 'direct-bound',
+        bindingId: directHello.message.bindingId
+      }
+    },
+    {
+      source: harness.parentWindow,
+      origin: 'https://evil.example',
+      ports: [],
+      data: {
+        protocol: 'boxim-miniapp-broker',
+        version: '1.0',
+        kind: 'direct-bound',
+        bindingId: directHello.message.bindingId
+      }
+    },
+    {
+      source: harness.parentWindow,
+      origin: 'http://localhost:8080',
+      ports: [{}],
+      data: {
+        protocol: 'boxim-miniapp-broker',
+        version: '1.0',
+        kind: 'direct-bound',
+        bindingId: directHello.message.bindingId
+      }
+    },
+    {
+      source: harness.parentWindow,
+      origin: 'http://localhost:8080',
+      ports: [],
+      data: {
+        protocol: 'boxim-miniapp-broker',
+        version: '1.0',
+        kind: 'direct-bound',
+        bindingId: ID
+      }
+    }
+  ]) listener(event)
+  await settle()
+  assert.equal(harness.parentWindow.sent.length, 1)
+
+  directBound(harness)
+  await settle()
+  assert.equal(harness.parentWindow.sent.length, 2)
+  assert.equal(harness.parentWindow.sent[1].message.method, 'miniapp.ready')
+  assert.equal(harness.parentWindow.sent[1].targetOrigin, 'http://localhost:8080')
+  listener({
+    source: harness.parentWindow,
+    origin: 'http://localhost:8080',
+    ports: [],
+    data: envelope()
+  })
+  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
+  harness.sdk.destroy()
+  assert.deepEqual(harness.sdk.diagnostics(), {
+    destroyed: true,
+    privateStateCleared: true
+  })
+})
+
+test('keeps HTTPS brokers on the isolated nested broker transport', () => {
+  const harness = createHarness()
+  assert.equal(harness.appended.length, 1)
+  assert.equal(harness.parentWindow.sent.length, 0)
+  assert.equal(harness.iframe.src, BROKER_URL)
+})
+
+test('fails closed before listener registration when direct binding entropy fails', () => {
+  const harness = createHarness({
+    name: preload({brokerUrl: LOCAL_BROKER_URL}),
+    trustedBrokerUrls: [LOCAL_BROKER_URL],
+    randomFailure: true
+  })
+  assert.deepEqual(harness.sdk.status(), {phase: 'BLOCKED', terminal: null})
+  assert.equal(harness.listeners.size, 0)
+  assert.equal(harness.parentWindow.sent.length, 0)
+  assert.deepEqual(harness.sdk.diagnostics(), {
+    destroyed: true,
+    privateStateCleared: true
+  })
 })
 
 test('sends one READY with an actual S256 PKCE challenge only after exact broker bound', async () => {
