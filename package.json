@@ -1,0 +1,8 @@
+{
+  "name": "miumiuchat-miniapp-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test miniapp-sdk.test.mjs"
+  }
+}

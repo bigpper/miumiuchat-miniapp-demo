@@ -159,120 +159,31 @@
       </div>
     </section>
   </main>
-  <script>
-    (function () {
-      "use strict";
-      var PROTOCOL = "boxim-miniapp";
-      var BROKER_PROTOCOL = "boxim-miniapp-broker";
-      var VERSION = "1.0";
-      var appId = "01KYN5H8CWSR2PJ6Q8WE46P12V";
-      var status = document.getElementById("bridge-status");
-      var detail = document.getElementById("bridge-detail");
-      var brokerFrame = null;
-      var brokerOrigin = null;
-      var pageNonce = null;
+  <script type="module">
+    import {createMiniAppSdk} from './miniapp-sdk.js';
 
-      function setState(label, message, ready) {
+    const status = document.getElementById('bridge-status');
+    const detail = document.getElementById('bridge-detail');
+    const view = {
+      CONNECTING: ['正在连接聊天系统', '正在建立安全桥接，请稍候…'],
+      READY_SENT: ['正在验证宿主', '安全桥接已建立，正在等待宿主确认…'],
+      HOST_READY: ['已连接聊天系统', 'MiniApp 安全桥接与宿主上下文已就绪。'],
+      RUNNING: ['演示运行中', '宿主已完成一次性启动授权。'],
+      BLOCKED: ['请从聊天系统打开', '此演示页只能作为 MiniApp 在聊天系统中运行。'],
+      CLOSED: ['已关闭', 'MiniApp 安全桥接已清理。']
+    };
+    createMiniAppSdk({
+      appId: '01KYN5H8CWSR2PJ6Q8WE46P12V',
+      onStatus({phase}) {
+        const [label, message] = view[phase];
         status.textContent = label;
         detail.textContent = message;
-        document.documentElement.dataset.bridgeReady = ready ? "true" : "false";
+        document.documentElement.dataset.bridgeReady = phase === 'RUNNING' ? 'true' : 'false';
+      },
+      onLaunchCode() {
+        // The static Demo intentionally has no BFF and never exchanges launch codes.
       }
-      function base64url(bytes) {
-        var binary = "";
-        for (var i = 0; i < bytes.length; i += 1) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-      }
-      function randomBase64url(length) {
-        var bytes = new Uint8Array(length);
-        crypto.getRandomValues(bytes);
-        return base64url(bytes);
-      }
-      function ulid() {
-        var alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-        var bytes = new Uint8Array(16);
-        var time = Date.now();
-        for (var index = 5; index >= 0; index -= 1) {
-          bytes[index] = time % 256;
-          time = Math.floor(time / 256);
-        }
-        crypto.getRandomValues(bytes.subarray(6));
-        var bits = "00";
-        for (var i = 0; i < bytes.length; i += 1) {
-          bits += bytes[i].toString(2).padStart(8, "0");
-        }
-        var result = "";
-        for (var offset = 0; offset < 130; offset += 5) {
-          result += alphabet[parseInt(bits.slice(offset, offset + 5), 2)];
-        }
-        return result;
-      }
-      function validPreload(value) {
-        return value
-          && value.protocol === BROKER_PROTOCOL
-          && value.version === VERSION
-          && value.kind === "preload"
-          && typeof value.brokerUrl === "string";
-      }
-      function sendReady() {
-        if (!brokerFrame || !brokerFrame.contentWindow || !brokerOrigin) return;
-        pageNonce = randomBase64url(24);
-        brokerFrame.contentWindow.postMessage({
-          protocol: PROTOCOL,
-          version: VERSION,
-          id: ulid(),
-          kind: "request",
-          method: "miniapp.ready",
-          nonce: pageNonce,
-          payload: {
-            appId: appId,
-            sdkVersion: "1.0.0",
-            protocolVersion: VERSION,
-            pageNonce: pageNonce,
-            pkceChallenge: randomBase64url(32),
-            pkceMethod: "S256",
-            requestedCapabilities: ["auth.launch", "host.context", "host.close"]
-          },
-          error: null
-        }, brokerOrigin);
-      }
-      window.addEventListener("message", function (event) {
-        if (!brokerFrame
-          || event.source !== brokerFrame.contentWindow
-          || event.origin !== brokerOrigin
-          || !event.data) {
-          return;
-        }
-        if (event.data.protocol === BROKER_PROTOCOL
-          && event.data.version === VERSION
-          && event.data.kind === "bound") {
-          sendReady();
-          return;
-        }
-        if (event.data.protocol === PROTOCOL
-          && event.data.version === VERSION
-          && event.data.nonce === pageNonce
-          && event.data.method === "host.init"
-          && event.data.error === null) {
-          setState("已连接聊天系统", "MiniApp 安全桥接与群身份上下文已就绪。", true);
-        }
-      });
-      try {
-        var preload = JSON.parse(window.name || "{}");
-        if (!validPreload(preload)) throw new Error("invalid preload");
-        var brokerUrl = new URL(preload.brokerUrl);
-        brokerOrigin = brokerUrl.origin;
-        brokerFrame = document.createElement("iframe");
-        brokerFrame.src = brokerUrl.href;
-        brokerFrame.title = "MiniApp secure bridge";
-        brokerFrame.hidden = true;
-        document.body.appendChild(brokerFrame);
-        setState("正在连接聊天系统", "正在建立安全桥接，请稍候…", false);
-      } catch (_) {
-        setState("请从聊天系统打开", "此演示页只能作为 MiniApp 在聊天系统中运行。", false);
-      }
-    }());
+    });
   </script>
 </body>
 </html>
