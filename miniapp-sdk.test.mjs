@@ -6,6 +6,8 @@ import {createMiniAppSdk} from './miniapp-sdk.js'
 const APP_ID = '01KYN5H8CWSR2PJ6Q8WE46P12V'
 const HOST_ORIGIN = 'https://im.example.com'
 const BROKER_URL = `${HOST_ORIGIN}/miniapp-host-broker.html`
+const LOCAL_BROKER_URL = 'http://localhost:8080/miniapp-host-broker.html'
+const NOW_MS = Date.parse('2026-07-30T00:00:00.000Z')
 const NONCE = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 const VERIFIER = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~'
 const ID = '01KYN5H8CWSR2PJ6Q8WE46P12W'
@@ -33,7 +35,7 @@ function envelope(overrides = {}) {
       sdkVersion: '1.0.0',
       protocolVersion: '1.0',
       grantedCapabilities: ['auth.launch'],
-      terminal: 'web',
+      terminal: 'WEB',
       locale: 'zh-CN',
       theme: {mode: 'light', backgroundColor: '#fff', textColor: '#000', accentColor: '#07c160'},
       safeArea: {top: 0, right: 0, bottom: 0, left: 0}
@@ -43,7 +45,14 @@ function envelope(overrides = {}) {
   }
 }
 
-function createHarness({name = preload(), launchCodeHandler = () => {}} = {}) {
+function createHarness({
+  name = preload(),
+  preloadedName,
+  trustedBrokerUrls = [BROKER_URL],
+  launchCodeHandler = () => {},
+  digestResult = async () => Uint8Array.from({length: 32}, (_, index) => index).buffer,
+  runtimeTraps = false
+} = {}) {
   const listeners = new Map()
   const iframeListeners = new Map()
   const iframe = {
@@ -64,16 +73,27 @@ function createHarness({name = preload(), launchCodeHandler = () => {}} = {}) {
   }
   const window = {
     name,
-    location: {origin: 'https://mini.example.com'},
     addEventListener(type, listener) { listeners.set(type, listener) },
     removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type) }
+  }
+  if (runtimeTraps) {
+    const forbidden = name => ({get() { throw new Error(`${name} touched`) }})
+    Object.defineProperties(window, {
+      localStorage: forbidden('localStorage'),
+      sessionStorage: forbidden('sessionStorage'),
+      indexedDB: forbidden('indexedDB'),
+      history: forbidden('history'),
+      location: forbidden('location'),
+      console: forbidden('console')
+    })
+    Object.defineProperty(document, 'cookie', forbidden('cookie'))
   }
   const crypto = {
     getRandomValues(bytes) { bytes.fill(1); return bytes },
     subtle: {async digest(name, bytes) {
       assert.equal(name, 'SHA-256')
       assert.equal(new TextDecoder().decode(bytes), VERIFIER)
-      return Uint8Array.from({length: 32}, (_, index) => index).buffer
+      return digestResult()
     }}
   }
   const statuses = []
@@ -82,11 +102,14 @@ function createHarness({name = preload(), launchCodeHandler = () => {}} = {}) {
     documentObject: document,
     cryptoObject: crypto,
     appId: APP_ID,
+    trustedBrokerUrls,
+    preloadedName,
     createId: () => ID,
     createNonce: () => NONCE,
     createVerifier: () => VERIFIER,
     onStatus: status => statuses.push(status),
-    onLaunchCode: launchCodeHandler
+    onLaunchCode: launchCodeHandler,
+    now: () => NOW_MS
   })
   return {sdk, window, document, iframe, listeners, iframeListeners, statuses}
 }
@@ -100,6 +123,11 @@ function bound(harness) {
   })
 }
 
+async function settle() {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
 test('clears window.name synchronously before any asynchronous PKCE work', () => {
   const harness = createHarness()
   assert.equal(harness.window.name, '')
@@ -107,8 +135,31 @@ test('clears window.name synchronously before any asynchronous PKCE work', () =>
   assert.equal(harness.sdk.status().phase, 'CONNECTING')
 })
 
-test('rejects preload with extra fields or a noncanonical broker before creating an iframe', () => {
-  for (const name of [preload({extra: true}), preload({brokerUrl: `${BROKER_URL}?x=1`})]) {
+test('uses an already captured preload while still clearing window.name synchronously', () => {
+  const harness = createHarness({name: 'not a preload', preloadedName: preload()})
+  assert.equal(harness.window.name, '')
+  assert.equal(harness.sdk.status().phase, 'CONNECTING')
+  assert.equal(harness.iframe.contentWindow.sent.length, 0)
+})
+
+test('accepts only an exactly allowlisted localhost broker and rejects all other broker URLs', () => {
+  const accepted = createHarness({
+    name: preload({brokerUrl: LOCAL_BROKER_URL}),
+    trustedBrokerUrls: [LOCAL_BROKER_URL]
+  })
+  assert.equal(accepted.sdk.status().phase, 'CONNECTING')
+  const future = 'https://host.example/miniapp-host-broker.html'
+  assert.equal(createHarness({
+    name: preload({brokerUrl: future}),
+    trustedBrokerUrls: [future]
+  }).sdk.status().phase, 'CONNECTING')
+  for (const name of [
+    preload({extra: true}),
+    preload({brokerUrl: `${LOCAL_BROKER_URL}?x=1`}),
+    preload({brokerUrl: 'http://evil.example/miniapp-host-broker.html'}),
+    preload({brokerUrl: 'https://evil.example/miniapp-host-broker.html'}),
+    preload({brokerUrl: 'https://im.example.com/other-broker.html'})
+  ]) {
     const harness = createHarness({name})
     assert.equal(harness.sdk.status().phase, 'BLOCKED')
     assert.equal(harness.listeners.size, 0)
@@ -118,9 +169,9 @@ test('rejects preload with extra fields or a noncanonical broker before creating
 test('sends one READY with an actual S256 PKCE challenge only after exact broker bound', async () => {
   const harness = createHarness()
   bound(harness)
-  await Promise.resolve()
+  await settle()
   bound(harness)
-  await Promise.resolve()
+  await settle()
   assert.equal(harness.iframe.contentWindow.sent.length, 1)
   const ready = harness.iframe.contentWindow.sent[0]
   assert.equal(ready.targetOrigin, HOST_ORIGIN)
@@ -138,32 +189,47 @@ test('rejects forged source, origin, ports, and non-closed broker or host envelo
     {source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [{}], data: {protocol: 'boxim-miniapp-broker', version: '1.0', kind: 'bound'}},
     {source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: {protocol: 'boxim-miniapp-broker', version: '1.0', kind: 'bound', extra: true}}
   ]) listener(event)
-  await Promise.resolve()
+  await settle()
   assert.equal(harness.iframe.contentWindow.sent.length, 0)
   bound(harness)
-  await Promise.resolve()
+  await settle()
   listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({extra: true})})
   assert.equal(harness.sdk.status().phase, 'READY_SENT')
 })
 
-test('accepts only an exact host.init for the READY nonce and exposes no sensitive state', async () => {
+test('accepts only a contract-exact host.init for the correlated READY request id', async () => {
   const harness = createHarness()
   bound(harness)
-  await Promise.resolve()
+  await settle()
   const listener = harness.listeners.get('message')
   listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({nonce: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'})})
   assert.equal(harness.sdk.status().phase, 'READY_SENT')
+  listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({id: '01KYN5H8CWSR2PJ6Q8WE46P12Y'})})
+  assert.equal(harness.sdk.status().phase, 'READY_SENT')
+  listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({payload: {...envelope().payload, terminal: 'web'}})})
+  assert.equal(harness.sdk.status().phase, 'READY_SENT')
+  for (const payload of [
+    {...envelope().payload, grantedCapabilities: ['auth.launch', 'auth.launch']},
+    {...envelope().payload, grantedCapabilities: ['unknown']},
+    {...envelope().payload, locale: ''},
+    {...envelope().payload, theme: {...envelope().payload.theme, extra: true}},
+    {...envelope().payload, safeArea: {...envelope().payload.safeArea, top: -1}},
+    {...envelope().payload, locale: 'x'.repeat(17_000)}
+  ]) {
+    listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope({payload})})
+    assert.equal(harness.sdk.status().phase, 'READY_SENT')
+  }
   listener({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: envelope()})
-  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'web'})
+  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
   assert.equal(JSON.stringify(harness.sdk.status()).includes(NONCE), false)
 })
 
-test('invokes the launch callback exactly once with a transport-local code', async () => {
+test('invokes the launch callback exactly once with a transport-local code after auth.launch is granted', async () => {
   let calls = 0
   let seen
   const harness = createHarness({launchCodeHandler(code) { calls += 1; seen = code }})
   bound(harness)
-  await Promise.resolve()
+  await settle()
   harness.listeners.get('message')({
     source: harness.iframe.contentWindow,
     origin: HOST_ORIGIN,
@@ -177,7 +243,7 @@ test('invokes the launch callback exactly once with a transport-local code', asy
       appId: APP_ID,
       versionId: '01KYN5H8CWSR2PJ6Q8WE46P12X',
       launchCode: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
-      expiresAt: '2030-01-01T00:00:00.000Z'
+      expiresAt: new Date(NOW_MS + 60_000).toISOString()
     }
   })
   const event = {source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: launch}
@@ -185,8 +251,34 @@ test('invokes the launch callback exactly once with a transport-local code', asy
   harness.listeners.get('message')(event)
   assert.equal(calls, 1)
   assert.equal(seen, launch.payload.launchCode)
-  assert.deepEqual(harness.sdk.status(), {phase: 'RUNNING', terminal: 'web'})
+  assert.deepEqual(harness.sdk.status(), {phase: 'RUNNING', terminal: 'WEB'})
   assert.equal(JSON.stringify(harness.sdk.status()).includes(launch.payload.launchCode), false)
+})
+
+test('does not launch when host.init omits auth.launch', async () => {
+  let calls = 0
+  const harness = createHarness({launchCodeHandler() { calls += 1 }})
+  bound(harness)
+  await settle()
+  harness.listeners.get('message')({
+    source: harness.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: envelope({payload: {...envelope().payload, grantedCapabilities: ['host.close']}})
+  })
+  const launch = envelope({
+    kind: 'event',
+    method: 'auth.launchCode',
+    payload: {
+      appId: APP_ID,
+      versionId: '01KYN5H8CWSR2PJ6Q8WE46P12X',
+      launchCode: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      expiresAt: new Date(NOW_MS + 60_000).toISOString()
+    }
+  })
+  harness.listeners.get('message')({source: harness.iframe.contentWindow, origin: HOST_ORIGIN, ports: [], data: launch})
+  assert.equal(calls, 0)
+  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
 })
 
 test('pagehide cleanup removes the broker and listener and clears private protocol state', async () => {
@@ -197,4 +289,24 @@ test('pagehide cleanup removes the broker and listener and clears private protoc
   assert.equal(harness.iframe.removeCalled, true)
   assert.equal(harness.listeners.has('message'), false)
   assert.deepEqual(harness.sdk.status(), {phase: 'CLOSED', terminal: null})
+  assert.deepEqual(harness.sdk.diagnostics(), {destroyed: true, privateStateCleared: true})
+})
+
+test('fails closed and clears broker, listeners, nonce, and verifier when PKCE generation fails', async () => {
+  const harness = createHarness({digestResult: async () => { throw new Error('digest failed') }})
+  bound(harness)
+  await settle()
+  assert.equal(harness.iframe.removeCalled, true)
+  assert.equal(harness.listeners.has('message'), false)
+  assert.deepEqual(harness.sdk.status(), {phase: 'BLOCKED', terminal: null})
+  assert.deepEqual(harness.sdk.diagnostics(), {destroyed: true, privateStateCleared: true})
+})
+
+test('does not touch browser persistence, navigation, console, cookie, or DOM sinks with protocol material', () => {
+  const harness = createHarness({runtimeTraps: true})
+  assert.deepEqual(harness.sdk.status(), {phase: 'CONNECTING', terminal: null})
+  assert.equal(harness.document.documentElement.dataset.bridgeReady, undefined)
+  assert.equal(harness.statuses.every(status =>
+    Object.keys(status).every(key => ['phase', 'terminal'].includes(key))
+  ), true)
 })

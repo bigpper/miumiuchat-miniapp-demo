@@ -11,6 +11,10 @@ const HOST_INIT_FIELDS = Object.freeze([
   'locale', 'theme', 'safeArea'
 ])
 const LAUNCH_FIELDS = Object.freeze(['appId', 'versionId', 'launchCode', 'expiresAt'])
+const THEME_FIELDS = Object.freeze(['mode', 'backgroundColor', 'textColor', 'accentColor'])
+const SAFE_AREA_FIELDS = Object.freeze(['top', 'right', 'bottom', 'left'])
+const REQUESTED_CAPABILITIES = Object.freeze(['auth.launch', 'host.backButton', 'host.close'])
+const MAX_ENVELOPE_BYTES = 16 * 1024
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object') return false
@@ -80,7 +84,9 @@ function decodedBase64urlBytes(value) {
 function canonicalBrokerUrl(value) {
   try {
     const parsed = new URL(value)
-    if (parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== ''
+    const allowedProtocol = parsed.protocol === 'https:'
+      || (parsed.protocol === 'http:' && parsed.hostname === 'localhost')
+    if (!allowedProtocol || parsed.username !== '' || parsed.password !== ''
       || parsed.search !== '' || parsed.hash !== '' || parsed.href !== value) return null
     return parsed
   } catch {
@@ -88,12 +94,12 @@ function canonicalBrokerUrl(value) {
   }
 }
 
-function validPreload(value) {
+function validPreload(value, trustedBrokerUrls) {
   return hasExactKeys(value, PRELOAD_FIELDS)
     && value.protocol === BROKER_PROTOCOL
     && value.version === VERSION
     && value.kind === 'preload'
-    && canonicalBrokerUrl(value.brokerUrl) !== null
+    && trustedBrokerUrls.has(value.brokerUrl)
 }
 
 function validBound(value) {
@@ -104,8 +110,11 @@ function validBound(value) {
 }
 
 function validEnvelope(value) {
+  let serialized
+  try { serialized = JSON.stringify(value) } catch { return false }
   return hasExactKeys(value, ENVELOPE_FIELDS)
     && isJsonValue(value)
+    && new TextEncoder().encode(serialized).byteLength <= MAX_ENVELOPE_BYTES
     && value.protocol === PROTOCOL
     && value.version === VERSION
     && isCanonicalUlid(value.id)
@@ -116,22 +125,37 @@ function validEnvelope(value) {
     && (value.error === null || isPlainObject(value.error))
 }
 
-function validHostInit(value, appId, nonce) {
+function validTheme(value) {
+  return hasExactKeys(value, THEME_FIELDS)
+    && ['light', 'dark'].includes(value.mode)
+    && ['backgroundColor', 'textColor', 'accentColor'].every(key =>
+      typeof value[key] === 'string' && value[key].length > 0
+    )
+}
+
+function validSafeArea(value) {
+  return hasExactKeys(value, SAFE_AREA_FIELDS)
+    && SAFE_AREA_FIELDS.every(key => Number.isFinite(value[key]) && value[key] >= 0)
+}
+
+function validHostInit(value, appId, nonce, readyRequestId) {
   const payload = value.payload
   return value.kind === 'response'
     && value.method === 'host.init'
     && value.nonce === nonce
+    && value.id === readyRequestId
     && value.error === null
     && hasExactKeys(payload, HOST_INIT_FIELDS)
     && payload.appId === appId
-    && typeof payload.sdkVersion === 'string'
+    && payload.sdkVersion === '1.0.0'
     && payload.protocolVersion === VERSION
     && Array.isArray(payload.grantedCapabilities)
-    && payload.grantedCapabilities.every(capability => typeof capability === 'string')
-    && typeof payload.terminal === 'string' && payload.terminal.length > 0
-    && typeof payload.locale === 'string'
-    && isPlainObject(payload.theme)
-    && isPlainObject(payload.safeArea)
+    && new Set(payload.grantedCapabilities).size === payload.grantedCapabilities.length
+    && payload.grantedCapabilities.every(capability => REQUESTED_CAPABILITIES.includes(capability))
+    && payload.terminal === 'WEB'
+    && typeof payload.locale === 'string' && payload.locale.length > 0
+    && validTheme(payload.theme)
+    && validSafeArea(payload.safeArea)
 }
 
 function validLaunch(value, appId, nonce, now) {
@@ -155,6 +179,8 @@ export function createMiniAppSdk({
   documentObject = document,
   cryptoObject = crypto,
   appId,
+  trustedBrokerUrls,
+  preloadedName,
   createId = () => secureUlid(cryptoObject),
   createNonce = () => randomBase64url(cryptoObject, 24),
   createVerifier = () => randomBase64url(cryptoObject, 32),
@@ -162,30 +188,38 @@ export function createMiniAppSdk({
   onLaunchCode = () => {},
   now = Date.now
 } = {}) {
-  const rawPreload = windowObject.name || ''
+  const rawPreload = typeof preloadedName === 'string' ? preloadedName : windowObject.name || ''
   windowObject.name = ''
+
+  const trustedBrokerUrlSet = new Set(
+    Array.isArray(trustedBrokerUrls)
+      ? trustedBrokerUrls.filter(url => canonicalBrokerUrl(url) !== null)
+      : []
+  )
 
   let brokerFrame = null
   let brokerOrigin = null
   let pageNonce = null
   let pkceVerifier = null
+  let readyRequestId = null
   let terminal = null
   let phase = 'BLOCKED'
   let readyStarted = false
   let launchConsumed = false
   let destroyed = false
+  let hostCapabilities = []
 
   function publish(nextPhase, nextTerminal = terminal) {
     phase = nextPhase
     terminal = typeof nextTerminal === 'string' ? nextTerminal : null
-    onStatus(Object.freeze({phase, terminal}))
+    try { onStatus(Object.freeze({phase, terminal})) } catch {}
   }
 
   function status() {
     return Object.freeze({phase, terminal})
   }
 
-  function cleanup() {
+  function teardown(finalPhase) {
     if (destroyed) return false
     destroyed = true
     windowObject.removeEventListener('message', onMessage)
@@ -199,8 +233,31 @@ export function createMiniAppSdk({
     brokerOrigin = null
     pageNonce = null
     pkceVerifier = null
-    publish('CLOSED', null)
+    readyRequestId = null
+    readyStarted = false
+    launchConsumed = false
+    hostCapabilities = []
+    publish(finalPhase, null)
     return true
+  }
+
+  function cleanup() {
+    return teardown('CLOSED')
+  }
+
+  function failClosed() {
+    return teardown('BLOCKED')
+  }
+
+  function diagnostics() {
+    return Object.freeze({
+      destroyed,
+      privateStateCleared: brokerFrame === null
+        && brokerOrigin === null
+        && pageNonce === null
+        && pkceVerifier === null
+        && readyRequestId === null
+    })
   }
 
   async function sendReady() {
@@ -216,10 +273,12 @@ export function createMiniAppSdk({
       if (destroyed || !brokerFrame || !brokerFrame.contentWindow) return
       const challenge = base64url(new Uint8Array(digest))
       if (decodedBase64urlBytes(challenge) !== 32) throw new TypeError('invalid challenge')
+      readyRequestId = createId()
+      if (!isCanonicalUlid(readyRequestId)) throw new TypeError('invalid request id')
       brokerFrame.contentWindow.postMessage({
         protocol: PROTOCOL,
         version: VERSION,
-        id: createId(),
+        id: readyRequestId,
         kind: 'request',
         method: 'miniapp.ready',
         nonce: pageNonce,
@@ -230,13 +289,13 @@ export function createMiniAppSdk({
           pageNonce,
           pkceChallenge: challenge,
           pkceMethod: 'S256',
-          requestedCapabilities: ['auth.launch', 'host.backButton', 'host.close']
+          requestedCapabilities: [...REQUESTED_CAPABILITIES]
         },
         error: null
       }, brokerOrigin)
       publish('READY_SENT')
     } catch {
-      if (!destroyed) publish('BLOCKED', null)
+      if (!destroyed) failClosed()
     }
   }
 
@@ -249,11 +308,13 @@ export function createMiniAppSdk({
       return
     }
     if (!validEnvelope(data) || pageNonce === null) return
-    if (phase === 'READY_SENT' && validHostInit(data, appId, pageNonce)) {
+    if (phase === 'READY_SENT' && validHostInit(data, appId, pageNonce, readyRequestId)) {
+      hostCapabilities = [...data.payload.grantedCapabilities]
       publish('HOST_READY', data.payload.terminal)
       return
     }
     if (phase === 'HOST_READY' && !launchConsumed && validLaunch(data, appId, pageNonce, now)) {
+      if (!hostCapabilities.includes('auth.launch')) return
       launchConsumed = true
       let launchCode = data.payload.launchCode
       try { onLaunchCode(launchCode) } catch {} finally { launchCode = null }
@@ -263,9 +324,10 @@ export function createMiniAppSdk({
 
   let parsed
   try { parsed = JSON.parse(rawPreload) } catch { parsed = null }
-  if (!appId || !validPreload(parsed)) {
+  if (!appId || trustedBrokerUrlSet.size === 0 || !validPreload(parsed, trustedBrokerUrlSet)) {
     publish('BLOCKED', null)
-    return Object.freeze({status, destroy: cleanup})
+    destroyed = true
+    return Object.freeze({status, destroy: cleanup, diagnostics})
   }
 
   const brokerUrl = canonicalBrokerUrl(parsed.brokerUrl)
@@ -279,5 +341,5 @@ export function createMiniAppSdk({
   windowObject.addEventListener('pagehide', cleanup, {once: true})
   documentObject.body.appendChild(brokerFrame)
   publish('CONNECTING', null)
-  return Object.freeze({status, destroy: cleanup})
+  return Object.freeze({status, destroy: cleanup, diagnostics})
 }

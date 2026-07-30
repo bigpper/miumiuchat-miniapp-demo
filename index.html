@@ -159,11 +159,13 @@
       </div>
     </section>
   </main>
-  <script type="module">
-    import {createMiniAppSdk} from './miniapp-sdk.js';
-
-    const status = document.getElementById('bridge-status');
-    const detail = document.getElementById('bridge-detail');
+  <script>
+    (function () {
+      'use strict';
+      const preloadedName = window.name || '';
+      window.name = '';
+      const status = document.getElementById('bridge-status');
+      const detail = document.getElementById('bridge-detail');
     const view = {
       CONNECTING: ['正在连接聊天系统', '正在建立安全桥接，请稍候…'],
       READY_SENT: ['正在验证宿主', '安全桥接已建立，正在等待宿主确认…'],
@@ -172,18 +174,26 @@
       BLOCKED: ['请从聊天系统打开', '此演示页只能作为 MiniApp 在聊天系统中运行。'],
       CLOSED: ['已关闭', 'MiniApp 安全桥接已清理。']
     };
-    createMiniAppSdk({
-      appId: '01KYN5H8CWSR2PJ6Q8WE46P12V',
-      onStatus({phase}) {
-        const [label, message] = view[phase];
-        status.textContent = label;
-        detail.textContent = message;
-        document.documentElement.dataset.bridgeReady = phase === 'RUNNING' ? 'true' : 'false';
-      },
-      onLaunchCode() {
-        // The static Demo intentionally has no BFF and never exchanges launch codes.
-      }
-    });
+      import('./miniapp-sdk.js').then(({createMiniAppSdk}) => {
+        createMiniAppSdk({
+          appId: '01KYN5H8CWSR2PJ6Q8WE46P12V',
+          trustedBrokerUrls: ['http://localhost:8080/miniapp-host-broker.html'],
+          preloadedName,
+          onStatus({phase}) {
+            const [label, message] = view[phase];
+            status.textContent = label;
+            detail.textContent = message;
+            document.documentElement.dataset.bridgeReady = phase === 'RUNNING' ? 'true' : 'false';
+          },
+          onLaunchCode() {
+            // The static Demo intentionally has no BFF and never exchanges launch codes.
+          }
+        });
+      }).catch(() => {
+        status.textContent = view.BLOCKED[0];
+        detail.textContent = view.BLOCKED[1];
+      });
+    }());
   </script>
 </body>
 </html>
