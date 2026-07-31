@@ -19,7 +19,7 @@ const SAFE_AREA_FIELDS = Object.freeze(['top', 'right', 'bottom', 'left'])
 const REQUESTED_CAPABILITIES = Object.freeze(['auth.launch', 'host.backButton', 'host.close'])
 const LOCAL_DIRECT_BROKER_URLS = Object.freeze([
   'http://localhost:8080/miniapp-host-broker.html',
-  'http://localhost:5173/static/miniapp-host-broker.html'
+  'http://localhost:5173/h5/static/miniapp-host-broker.html'
 ])
 const MAX_ENVELOPE_BYTES = 16 * 1024
 

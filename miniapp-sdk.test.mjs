@@ -9,7 +9,7 @@ const APP_ID = '01KYN5H8CWSR2PJ6Q8WE46P12V'
 const HOST_ORIGIN = 'https://im.example.com'
 const BROKER_URL = `${HOST_ORIGIN}/miniapp-host-broker.html`
 const LOCAL_BROKER_URL = 'http://localhost:8080/miniapp-host-broker.html'
-const UNIAPP_H5_BROKER_URL = 'http://localhost:5173/static/miniapp-host-broker.html'
+const UNIAPP_H5_BROKER_URL = 'http://localhost:5173/h5/static/miniapp-host-broker.html'
 const NOW_MS = Date.parse('2026-07-30T00:00:00.000Z')
 const MAX_ENVELOPE_BYTES = 16 * 1024
 const NONCE = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
@@ -400,9 +400,10 @@ test('uses the exact UniApp H5 broker source and origin for the parent-bound han
 test('rejects unlisted UniApp H5 broker paths, queries, and ports', () => {
   for (const brokerUrl of [
     'http://localhost:5173/miniapp-host-broker.html',
+    'http://localhost:5173/static/miniapp-host-broker.html',
     `${UNIAPP_H5_BROKER_URL}?debug=1`,
-    'http://localhost:5174/static/miniapp-host-broker.html',
-    'http://localhost:5173/static/miniapp-host-broker.html/extra'
+    'http://localhost:5174/h5/static/miniapp-host-broker.html',
+    'http://localhost:5173/h5/static/miniapp-host-broker.html/extra'
   ]) {
     const harness = createHarness({
       name: preload({brokerUrl}),

@@ -10,7 +10,7 @@ an HTTP broker as active mixed content:
 
 - `http://localhost:8080/miniapp-host-broker.html` is the Web/Electron local
   host broker.
-- `http://localhost:5173/static/miniapp-host-broker.html` is the UniApp H5
+- `http://localhost:5173/h5/static/miniapp-host-broker.html` is the UniApp H5
   local host broker.
 
 The fallback is restricted to these two exact URLs, correlates a fresh binding
