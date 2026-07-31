@@ -497,6 +497,19 @@ test('accepts only a contract-exact host.init for the correlated READY request i
   assert.equal(JSON.stringify(harness.sdk.status()).includes(NONCE), false)
 })
 
+test('accepts the contract-exact H5 host terminal', async () => {
+  const harness = createHarness()
+  bound(harness)
+  await settle()
+  harness.listeners.get('message')({
+    source: harness.iframe.contentWindow,
+    origin: HOST_ORIGIN,
+    ports: [],
+    data: envelope({payload: {...envelope().payload, terminal: 'H5'}})
+  })
+  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'H5'})
+})
+
 test('accepts a 16,384-byte envelope and rejects a 16,385-byte envelope', async () => {
   const accepted = createHarness()
   bound(accepted)
