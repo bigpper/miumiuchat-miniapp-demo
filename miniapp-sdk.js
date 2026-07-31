@@ -17,6 +17,10 @@ const LAUNCH_FIELDS = Object.freeze(['appId', 'versionId', 'launchCode', 'expire
 const THEME_FIELDS = Object.freeze(['mode', 'backgroundColor', 'textColor', 'accentColor'])
 const SAFE_AREA_FIELDS = Object.freeze(['top', 'right', 'bottom', 'left'])
 const REQUESTED_CAPABILITIES = Object.freeze(['auth.launch', 'host.backButton', 'host.close'])
+const LOCAL_DIRECT_BROKER_URLS = Object.freeze([
+  'http://localhost:8080/miniapp-host-broker.html',
+  'http://localhost:5173/static/miniapp-host-broker.html'
+])
 const MAX_ENVELOPE_BYTES = 16 * 1024
 
 function isPlainObject(value) {
@@ -361,9 +365,7 @@ export function createMiniAppSdk({
 
   const brokerUrl = canonicalBrokerUrl(parsed.brokerUrl)
   brokerOrigin = brokerUrl.origin
-  directBridge = brokerUrl.protocol === 'http:'
-    && brokerUrl.hostname === 'localhost'
-    && brokerUrl.pathname === '/miniapp-host-broker.html'
+  directBridge = LOCAL_DIRECT_BROKER_URLS.includes(brokerUrl.href)
     && windowObject.location?.protocol === 'https:'
     && windowObject.parent
     && windowObject.parent !== windowObject

@@ -9,6 +9,7 @@ const APP_ID = '01KYN5H8CWSR2PJ6Q8WE46P12V'
 const HOST_ORIGIN = 'https://im.example.com'
 const BROKER_URL = `${HOST_ORIGIN}/miniapp-host-broker.html`
 const LOCAL_BROKER_URL = 'http://localhost:8080/miniapp-host-broker.html'
+const UNIAPP_H5_BROKER_URL = 'http://localhost:5173/static/miniapp-host-broker.html'
 const NOW_MS = Date.parse('2026-07-30T00:00:00.000Z')
 const MAX_ENVELOPE_BYTES = 16 * 1024
 const NONCE = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
@@ -182,11 +183,11 @@ function bound(harness) {
   })
 }
 
-function directBound(harness) {
+function directBound(harness, origin = 'http://localhost:8080') {
   const hello = harness.parentWindow.sent[0]?.message
   harness.listeners.get('message')({
     source: harness.parentWindow,
-    origin: 'http://localhost:8080',
+    origin,
     ports: [],
     data: {
       protocol: 'boxim-miniapp-broker',
@@ -354,6 +355,64 @@ test('uses a parent-bound bridge for the exact HTTPS-to-localhost mixed-content 
     destroyed: true,
     privateStateCleared: true
   })
+})
+
+test('uses the exact UniApp H5 broker source and origin for the parent-bound handshake', async () => {
+  const harness = createHarness({
+    name: preload({brokerUrl: UNIAPP_H5_BROKER_URL}),
+    trustedBrokerUrls: [LOCAL_BROKER_URL, UNIAPP_H5_BROKER_URL]
+  })
+  assert.equal(harness.appended.length, 0)
+  const directHello = harness.parentWindow.sent[0]
+  assert.equal(directHello.targetOrigin, 'http://localhost:5173')
+  assert.equal(directHello.message.kind, 'direct-hello')
+
+  const listener = harness.listeners.get('message')
+  listener({
+    source: {},
+    origin: 'http://localhost:5173',
+    ports: [],
+    data: {
+      protocol: 'boxim-miniapp-broker',
+      version: '1.0',
+      kind: 'direct-bound',
+      bindingId: directHello.message.bindingId
+    }
+  })
+  await settle()
+  assert.equal(harness.parentWindow.sent.length, 1)
+
+  directBound(harness, 'http://localhost:5173')
+  await settle()
+  assert.equal(harness.parentWindow.sent.length, 2)
+  assert.equal(harness.parentWindow.sent[1].message.method, 'miniapp.ready')
+  assert.equal(harness.parentWindow.sent[1].targetOrigin, 'http://localhost:5173')
+
+  listener({
+    source: harness.parentWindow,
+    origin: 'http://localhost:5173',
+    ports: [],
+    data: envelope()
+  })
+  assert.deepEqual(harness.sdk.status(), {phase: 'HOST_READY', terminal: 'WEB'})
+})
+
+test('rejects unlisted UniApp H5 broker paths, queries, and ports', () => {
+  for (const brokerUrl of [
+    'http://localhost:5173/miniapp-host-broker.html',
+    `${UNIAPP_H5_BROKER_URL}?debug=1`,
+    'http://localhost:5174/static/miniapp-host-broker.html',
+    'http://localhost:5173/static/miniapp-host-broker.html/extra'
+  ]) {
+    const harness = createHarness({
+      name: preload({brokerUrl}),
+      trustedBrokerUrls: [LOCAL_BROKER_URL, UNIAPP_H5_BROKER_URL]
+    })
+    assert.deepEqual(harness.sdk.status(), {phase: 'BLOCKED', terminal: null})
+    assert.equal(harness.listeners.size, 0)
+    assert.equal(harness.parentWindow.sent.length, 0)
+    assert.equal(harness.appended.length, 0)
+  }
 })
 
 test('keeps HTTPS brokers on the isolated nested broker transport', () => {
@@ -599,7 +658,11 @@ test('executes the real inline bootstrap with a synchronously cleared captured p
   assert.equal(result.importCalls, 1)
   assert.equal(result.options.length, 1)
   assert.equal(result.options[0].preloadedName, result.preloadValue)
-  assert.deepEqual(Array.from(result.options[0].trustedBrokerUrls), [LOCAL_BROKER_URL])
+  assert.equal(result.options[0].appId, APP_ID)
+  assert.deepEqual(Array.from(result.options[0].trustedBrokerUrls), [
+    LOCAL_BROKER_URL,
+    UNIAPP_H5_BROKER_URL
+  ])
   assert.equal(result.status.textContent.includes(result.preloadValue), false)
   assert.equal(result.detail.textContent.includes(result.preloadValue), false)
   assert.equal(JSON.stringify(result.document.documentElement.dataset).includes(result.preloadValue), false)
