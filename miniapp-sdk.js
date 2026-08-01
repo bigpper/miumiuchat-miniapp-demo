@@ -17,7 +17,7 @@ const LAUNCH_FIELDS = Object.freeze(['appId', 'versionId', 'launchCode', 'expire
 const THEME_FIELDS = Object.freeze(['mode', 'backgroundColor', 'textColor', 'accentColor'])
 const SAFE_AREA_FIELDS = Object.freeze(['top', 'right', 'bottom', 'left'])
 const REQUESTED_CAPABILITIES = Object.freeze(['auth.launch', 'host.backButton', 'host.close'])
-const SUPPORTED_HOST_TERMINALS = Object.freeze(['WEB', 'H5'])
+const SUPPORTED_HOST_TERMINALS = Object.freeze(['WEB', 'H5', 'ELECTRON'])
 const LOCAL_DIRECT_BROKER_URLS = Object.freeze([
   'http://localhost:8080/miniapp-host-broker.html',
   'http://localhost:5173/h5/static/miniapp-host-broker.html'
