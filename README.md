@@ -4,12 +4,15 @@ This is a static MiniApp bridge demonstration. It accepts only its pinned,
 exact host broker URL, performs an in-memory PKCE S256 handshake, and invokes
 the one-time launch-code callback only for lifecycle demonstration.
 
-HTTPS hosts use the isolated nested broker. Two pinned local development
+Electron uses only the exact `miniAppHostBridge` API exposed by the isolated
+preload context. It verifies the Electron terminal contract and unregisters the
+native listener on page teardown.
+
+HTTPS browser hosts use the isolated nested broker. Two pinned local development
 brokers use an exact-source parent bridge because an HTTPS MiniApp cannot embed
 an HTTP broker as active mixed content:
 
-- `http://localhost:8080/miniapp-host-broker.html` is the Web/Electron local
-  host broker.
+- `http://localhost:8080/miniapp-host-broker.html` is the Web local host broker.
 - `http://localhost:5173/h5/static/miniapp-host-broker.html` is the UniApp H5
   local host broker.
 

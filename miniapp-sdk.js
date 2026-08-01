@@ -164,7 +164,7 @@ function isDenseCapabilityArray(value) {
     )
 }
 
-function validHostInit(value, appId, nonce, readyRequestId) {
+function validHostInit(value, appId, nonce, readyRequestId, expectedTerminal = null) {
   const payload = value.payload
   return value.kind === 'response'
     && value.method === 'host.init'
@@ -178,9 +178,28 @@ function validHostInit(value, appId, nonce, readyRequestId) {
     && isDenseCapabilityArray(payload.grantedCapabilities)
     && new Set(payload.grantedCapabilities).size === payload.grantedCapabilities.length
     && SUPPORTED_HOST_TERMINALS.includes(payload.terminal)
+    && (expectedTerminal === null || payload.terminal === expectedTerminal)
     && typeof payload.locale === 'string' && payload.locale.length > 0
     && validTheme(payload.theme)
     && validSafeArea(payload.safeArea)
+}
+
+function validElectronBridge(value) {
+  try {
+    if (!value || typeof value !== 'object') return false
+    const fields = ['postMessage', 'onMessage']
+    const keys = Reflect.ownKeys(value)
+    return keys.length === fields.length
+      && keys.every(key => typeof key === 'string' && fields.includes(key))
+      && fields.every(key => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        return descriptor
+          && Object.prototype.hasOwnProperty.call(descriptor, 'value')
+          && typeof descriptor.value === 'function'
+      })
+  } catch {
+    return false
+  }
 }
 
 function validLaunch(value, appId, nonce, now) {
@@ -225,6 +244,8 @@ export function createMiniAppSdk({
   let brokerFrame = null
   let brokerOrigin = null
   let transportWindow = null
+  let electronBridge = null
+  let unsubscribeElectron = null
   let directBindingId = null
   let directBridge = false
   let pageNonce = null
@@ -252,6 +273,7 @@ export function createMiniAppSdk({
     destroyed = true
     windowObject.removeEventListener('message', onMessage)
     windowObject.removeEventListener('pagehide', cleanup)
+    try { unsubscribeElectron?.() } catch {}
     if (brokerFrame) {
       try { brokerFrame.src = 'about:blank' } catch {}
       if (typeof brokerFrame.remove === 'function') brokerFrame.remove()
@@ -260,6 +282,8 @@ export function createMiniAppSdk({
     brokerFrame = null
     brokerOrigin = null
     transportWindow = null
+    electronBridge = null
+    unsubscribeElectron = null
     directBindingId = null
     directBridge = false
     pageNonce = null
@@ -286,6 +310,8 @@ export function createMiniAppSdk({
       privateStateCleared: brokerFrame === null
         && brokerOrigin === null
         && transportWindow === null
+        && electronBridge === null
+        && unsubscribeElectron === null
         && directBindingId === null
         && pageNonce === null
         && pkceVerifier === null
@@ -294,7 +320,8 @@ export function createMiniAppSdk({
   }
 
   async function sendReady() {
-    if (destroyed || readyStarted || !transportWindow || !brokerOrigin) return
+    if (destroyed || readyStarted
+      || (!electronBridge && (!transportWindow || !brokerOrigin))) return
     readyStarted = true
     try {
       pageNonce = createNonce()
@@ -303,12 +330,12 @@ export function createMiniAppSdk({
         || typeof pkceVerifier !== 'string'
         || !/^[A-Za-z0-9\-._~]{43,128}$/.test(pkceVerifier)) throw new TypeError('invalid local key material')
       const digest = await cryptoObject.subtle.digest('SHA-256', new TextEncoder().encode(pkceVerifier))
-      if (destroyed || !transportWindow) return
+      if (destroyed || (!electronBridge && !transportWindow)) return
       const challenge = base64url(new Uint8Array(digest))
       if (decodedBase64urlBytes(challenge) !== 32) throw new TypeError('invalid challenge')
       readyRequestId = createId()
       if (!isCanonicalUlid(readyRequestId)) throw new TypeError('invalid request id')
-      transportWindow.postMessage({
+      const ready = {
         protocol: PROTOCOL,
         version: VERSION,
         id: readyRequestId,
@@ -325,10 +352,34 @@ export function createMiniAppSdk({
           requestedCapabilities: [...REQUESTED_CAPABILITIES]
         },
         error: null
-      }, brokerOrigin)
+      }
+      if (electronBridge) {
+        if (electronBridge.postMessage(ready) !== true) {
+          throw new Error('Electron bridge rejected ready')
+        }
+      } else {
+        transportWindow.postMessage(ready, brokerOrigin)
+      }
       publish('READY_SENT')
     } catch {
       if (!destroyed) failClosed()
+    }
+  }
+
+  function onHostEnvelope(data, expectedTerminal = null) {
+    if (!validEnvelope(data) || pageNonce === null) return
+    if (phase === 'READY_SENT'
+      && validHostInit(data, appId, pageNonce, readyRequestId, expectedTerminal)) {
+      hostCapabilities = [...data.payload.grantedCapabilities]
+      publish('HOST_READY', data.payload.terminal)
+      return
+    }
+    if (phase === 'HOST_READY' && !launchConsumed && validLaunch(data, appId, pageNonce, now)) {
+      if (!hostCapabilities.includes('auth.launch')) return
+      launchConsumed = true
+      let launchCode = data.payload.launchCode
+      try { onLaunchCode(launchCode) } catch {} finally { launchCode = null }
+      publish('RUNNING')
     }
   }
 
@@ -341,18 +392,29 @@ export function createMiniAppSdk({
       sendReady()
       return
     }
-    if (!validEnvelope(data) || pageNonce === null) return
-    if (phase === 'READY_SENT' && validHostInit(data, appId, pageNonce, readyRequestId)) {
-      hostCapabilities = [...data.payload.grantedCapabilities]
-      publish('HOST_READY', data.payload.terminal)
-      return
-    }
-    if (phase === 'HOST_READY' && !launchConsumed && validLaunch(data, appId, pageNonce, now)) {
-      if (!hostCapabilities.includes('auth.launch')) return
-      launchConsumed = true
-      let launchCode = data.payload.launchCode
-      try { onLaunchCode(launchCode) } catch {} finally { launchCode = null }
-      publish('RUNNING')
+    onHostEnvelope(data)
+  }
+
+  const nativeBridge = windowObject.miniAppHostBridge
+  if (validElectronBridge(nativeBridge)) {
+    electronBridge = nativeBridge
+    try {
+      unsubscribeElectron = electronBridge.onMessage(data => {
+        if (!destroyed) onHostEnvelope(data, 'ELECTRON')
+      })
+      if (typeof unsubscribeElectron !== 'function') {
+        throw new TypeError('Electron bridge unsubscribe is required')
+      }
+      windowObject.addEventListener('pagehide', cleanup, {once: true})
+      publish('CONNECTING', null)
+      void sendReady()
+      return Object.freeze({status, destroy: cleanup, diagnostics})
+    } catch {
+      electronBridge = null
+      unsubscribeElectron = null
+      destroyed = true
+      publish('BLOCKED', null)
+      return Object.freeze({status, destroy: cleanup, diagnostics})
     }
   }
 

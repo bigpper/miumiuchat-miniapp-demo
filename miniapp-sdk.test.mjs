@@ -60,6 +60,7 @@ function createHarness({
   name = preload(),
   preloadedName,
   trustedBrokerUrls = [BROKER_URL],
+  electronBridge = null,
   launchCodeHandler = () => {},
   digestResult = async () => Uint8Array.from({length: 32}, (_, index) => index).buffer,
   randomFailure = false,
@@ -113,6 +114,9 @@ function createHarness({
     removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type) }
   }
   window.self = window
+  if (electronBridge !== null) {
+    window.miniAppHostBridge = electronBridge
+  }
   if (runtimeTraps) {
     const forbidden = name => ({get() { throw new Error(`${name} touched`) }})
     Object.defineProperties(window, {
@@ -171,6 +175,33 @@ function createHarness({
     iframeListeners,
     statuses,
     domWrites
+  }
+}
+
+function electronBridgeHarness() {
+  let callback = null
+  let active = true
+  const sent = []
+  const bridge = Object.freeze({
+    postMessage(message) {
+      sent.push(message)
+      return true
+    },
+    onMessage(next) {
+      callback = next
+      return () => {
+        if (!active) return false
+        active = false
+        callback = null
+        return true
+      }
+    }
+  })
+  return {
+    bridge,
+    sent,
+    deliver(message) { callback?.(message) },
+    get active() { return active }
   }
 }
 
@@ -249,6 +280,74 @@ test('uses an already captured preload while still clearing window.name synchron
   assert.equal(harness.window.name, '')
   assert.equal(harness.sdk.status().phase, 'CONNECTING')
   assert.equal(harness.iframe.contentWindow.sent.length, 0)
+})
+
+test('uses the exact Electron preload bridge for ready launch and cleanup',
+  async () => {
+    let launches = 0
+    const native = electronBridgeHarness()
+    const harness = createHarness({
+      name: '',
+      trustedBrokerUrls: [],
+      electronBridge: native.bridge,
+      launchCodeHandler() { launches += 1 }
+    })
+
+    assert.equal(harness.window.name, '')
+    assert.equal(harness.appended.length, 0)
+    assert.deepEqual(harness.sdk.status(), {
+      phase: 'CONNECTING',
+      terminal: null
+    })
+    await settle()
+    assert.equal(native.sent.length, 1)
+    assert.equal(native.sent[0].method, 'miniapp.ready')
+    assert.equal(native.sent[0].payload.appId, APP_ID)
+
+    native.deliver(envelope({
+      payload: {...envelope().payload, terminal: 'ELECTRON'}
+    }))
+    assert.deepEqual(harness.sdk.status(), {
+      phase: 'HOST_READY',
+      terminal: 'ELECTRON'
+    })
+    native.deliver(envelope({
+      kind: 'event',
+      method: 'auth.launchCode',
+      payload: {
+        appId: APP_ID,
+        versionId: '01KYN5H8CWSR2PJ6Q8WE46P12X',
+        launchCode: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+        expiresAt: new Date(NOW_MS + 60_000).toISOString()
+      }
+    }))
+    assert.equal(launches, 1)
+    assert.deepEqual(harness.sdk.status(), {
+      phase: 'RUNNING',
+      terminal: 'ELECTRON'
+    })
+
+    harness.listeners.get('pagehide')()
+    assert.equal(native.active, false)
+    assert.deepEqual(harness.sdk.diagnostics(), {
+      destroyed: true,
+      privateStateCleared: true
+    })
+  })
+
+test('Electron transport rejects a host terminal downgrade', async () => {
+  const native = electronBridgeHarness()
+  const harness = createHarness({
+    name: '',
+    trustedBrokerUrls: [],
+    electronBridge: native.bridge
+  })
+  await settle()
+  native.deliver(envelope())
+  assert.deepEqual(harness.sdk.status(), {
+    phase: 'READY_SENT',
+    terminal: null
+  })
 })
 
 test('accepts only an exactly allowlisted localhost broker and rejects all other broker URLs', () => {
