@@ -234,7 +234,7 @@ async function settle() {
   await Promise.resolve()
 }
 
-async function runInlineBootstrap({rejectImport = false} = {}) {
+async function runInlineBootstrap({rejectImport = false, search = null} = {}) {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8')
   const inlineScript = html.match(/<script>\s*([\s\S]*?)<\/script>\s*<\/body>/)?.[1]
   assert.ok(inlineScript)
@@ -245,7 +245,11 @@ async function runInlineBootstrap({rejectImport = false} = {}) {
     documentElement: {dataset: {}},
     getElementById(id) { return id === 'bridge-status' ? status : detail }
   }
-  const window = {name: preloadValue}
+  // search 为 null 时不注入 location，复现「没有 location」的环境，
+  // 页面必须安全降级到默认 appId 而不是抛异常。
+  const window = search === null
+    ? {name: preloadValue}
+    : {name: preloadValue, location: {search}}
   const options = []
   let importCalls = 0
   const context = vm.createContext({window, document})
@@ -806,4 +810,41 @@ test('renders only BLOCKED copy when the real inline bootstrap import fails', as
   assert.equal(result.detail.textContent, '此演示页只能作为 MiniApp 在聊天系统中运行。')
   assert.equal(result.status.textContent.includes(result.preloadValue), false)
   assert.equal(result.detail.textContent.includes(result.preloadValue), false)
+})
+
+test('?appId= 指定合法 ULID 时，页面以该 appId 建立桥接', async () => {
+  const requested = '01KZN7J38T0HKSMP7DQM0KFH80'
+  const result = await runInlineBootstrap({search: `?appId=${requested}`})
+  assert.equal(result.options.length, 1)
+  assert.equal(result.options[0].appId, requested)
+})
+
+test('没有 ?appId= 时回落到默认 appId，老入口地址照常工作', async () => {
+  const result = await runInlineBootstrap({search: '?other=1'})
+  assert.equal(result.options[0].appId, APP_ID)
+})
+
+test('?appId= 不是规范 ULID 时一律忽略，不把脏值交给宿主', async () => {
+  for (const bad of [
+    'not-a-ulid',
+    '01KZN7J38T0HKSMP7DQM0KFH8',       // 25 位
+    '01KZN7J38T0HKSMP7DQM0KFH80X',     // 27 位
+    '01IZN7J38T0HKSMP7DQM0KFH80',      // 含 I，Crockford 不允许
+    '01kzn7j38t0hksmp7dqm0kfh80',      // 小写
+    ''
+  ]) {
+    const result = await runInlineBootstrap({
+      search: `?appId=${encodeURIComponent(bad)}`
+    })
+    assert.equal(
+      result.options[0].appId, APP_ID,
+      `${bad} 应被忽略并回落到默认值`
+    )
+  }
+})
+
+test('缺少 location 时不抛异常（测试与非浏览器环境）', async () => {
+  const result = await runInlineBootstrap({search: null})
+  assert.equal(result.options.length, 1)
+  assert.equal(result.options[0].appId, APP_ID)
 })

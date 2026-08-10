@@ -174,9 +174,35 @@
       BLOCKED: ['请从聊天系统打开', '此演示页只能作为 MiniApp 在聊天系统中运行。'],
       CLOSED: ['已关闭', 'MiniApp 安全桥接已清理。']
     };
+      // 允许用 ?appId=<ULID> 指定本页扮演哪个小程序。
+      //
+      // 不指定时保持原来的固定值，老的入口地址照常工作。
+      //
+      // 这样做不降低安全性：宿主才是权威方，它只会下发自己实际启动的那个
+      // appId；页面这里声明什么，只决定「对不上就拒绝」，无法冒充成别的应用。
+      // 反过来，写死单一 appId 会让同一份演示页服务不了第二个小程序——
+      // 那正是它此前的限制。
+      const DEFAULT_APP_ID = '01KYN5H8CWSR2PJ6Q8WE46P12V';
+      const CANONICAL_ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+      const requestedAppId = (function () {
+        try {
+          // 测试环境只注入 window 与 document，没有 location；缺失时降级。
+          const search = window.location && window.location.search;
+          if (!search) return null;
+          // 手工解析而不用 URLSearchParams：这个页面要跑在老 webview 里，
+          // 少一个全局依赖就少一处「在某些环境里静默回落」的可能。
+          const match = /[?&]appId=([^&]*)/.exec(search);
+          if (!match) return null;
+          const value = decodeURIComponent(match[1]);
+          return CANONICAL_ULID.test(value) ? value : null;
+        } catch (error) {
+          return null;
+        }
+      }());
+
       import('./miniapp-sdk.js').then(({createMiniAppSdk}) => {
         createMiniAppSdk({
-          appId: '01KYN5H8CWSR2PJ6Q8WE46P12V',
+          appId: requestedAppId || DEFAULT_APP_ID,
           trustedBrokerUrls: [
             'http://localhost:8080/miniapp-host-broker.html',
             'http://localhost:5173/h5/static/miniapp-host-broker.html'
